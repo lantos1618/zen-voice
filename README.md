@@ -105,8 +105,24 @@ The source is Zen, including direct `c.bind` declarations for POSIX pipe/poll an
 Darwin errno. There is no handwritten C bridge, Python runtime, or filesystem
 mailbox. The current implementation targets macOS: `__error`, poll layout, and
 pipe buffering assumptions must be adapted and validated before other platforms.
-Shutdown relies on one maximum 4,002-byte reply fitting the macOS pipe buffer;
+Shutdown relies on one maximum 4,058-byte traced reply fitting the macOS pipe buffer;
 this is a capacity assumption, not a claim about portable `PIPE_BUF` atomicity.
+
+## Optional numeric request tracing
+
+Call `tracing(VoiceTrace(request: id, parent: parent_id, enqueued: now))` before
+admitting a request. `Transcript.trace` carries that context back with absolute
+monotonic worker-start, worker-end and result-write timestamps. IDs are caller
+owned; zero disables tracing. Context is copied with actor messages, and changing
+the next context cannot change an in-flight request. Timing includes model load,
+audio copying and recognition inside the worker; it is not a GPU-only measurement.
+
+Tracing adds a fixed 56-byte process-local header to the existing bounded reply.
+With tracing disabled, reply framing remains status/text/NUL, no trace header is
+allocated and no tracing clocks are read. The optional header contains numbers
+only; it does not add audio or transcription text to telemetry. An allocation
+failure retains the admitted request ID but leaves incomplete timing, allowing
+the caller to mark that span failed without attaching it to a newer request.
 
 ## Tests
 
@@ -115,7 +131,8 @@ python3 tests/run.py
 python3 tests/run.py --model ../zen-parakeet/models/parakeet-tdt-0.6b-v3.q8_0.gguf --wav ../zen-parakeet/build/fixture.wav
 ```
 
-The mandatory native test checks preparation failure and reply tagging, model/backend identity refusal, one simulated hour of scheduler state, model failure, one-in-flight admission,
+The mandatory native test checks numeric request/parent correlation, monotonic
+phase ordering, disabled legacy framing, preparation failure and reply tagging, model/backend identity refusal, one simulated hour of scheduler state, model failure, one-in-flight admission,
 nonblocking polling, repeated close, and live busy/final/stale scheduling.
 The optional WAV must be the known 16 kHz mono float32 quick-brown-fox fixture
 from zen-parakeet. It first prepares the real model, rejects changed model/backend requests, then asserts recognized words in a live partial, the complete

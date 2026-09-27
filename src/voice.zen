@@ -19,12 +19,15 @@ Polling = c.bind("poll.h", "poll", {
 })
 
 MailboxError* = OpenFailed | ReadFailed | Closed
-Transcript* = { preparation*: bool, success*: bool, text*: str, session*: usize, final*: bool, ends_capture*: bool, count*: usize }
+// Numeric metadata only. Zero request disables all tracing clocks/header work.
+// Times are absolute monotonic nanoseconds from the caller's Env clock.
+VoiceTrace* = { request* :: u64 = 0, parent* :: u64 = 0, enqueued* :: u64 = 0, started* :: u64 = 0, ended* :: u64 = 0, replied* :: u64 = 0 }
+Transcript* = { trace* :: VoiceTrace = VoiceTrace(), preparation*: bool, success*: bool, text*: str, session*: usize, final*: bool, ends_capture*: bool, count*: usize }
 
 // The UI admits one job until its complete reply arrives. The result actor
 // writes that reply; rejected result admission uses the worker error fallback.
-// A reply is one status byte, at most 4000 text bytes, then NUL.
-// This macOS app relies on Darwin's pipe buffer holding the one 4002-byte reply
+// A reply is an optional 56-byte trace header, status, <=4000 text bytes, NUL.
+// This macOS app relies on Darwin's pipe buffer holding the one <=4058-byte reply
 // during close/join. PIPE_BUF is an atomicity limit, not that buffer's capacity;
 // a single writer plus partial-read framing does not require an atomic record.
 write_all = (fd: i32, text: str) bool {
@@ -42,7 +45,7 @@ write_all = (fd: i32, text: str) bool {
     good
 }
 
-write_reply = (fd: i32, success: bool, text: str) () {
+write_reply_body = (fd: i32, success: bool, text: str) () {
     length ::= text.len;
     (length > 4000).then(() {
         length = 4000;
@@ -56,20 +59,46 @@ write_reply = (fd: i32, success: bool, text: str) () {
     });
 }
 
+// Optional 56-byte native-process header. The existing single-writer framing
+// stays bounded at 4058 bytes, below the caller's 4096-byte buffer. Disabled
+// tracing uses exactly the legacy status/text/NUL framing and no trace scratch.
+write_reply = (fd: i32, env: Env, trace: VoiceTrace, success: bool, text: str) () {
+    (trace.request == 0).match({
+        true => write_reply_body(fd, success, text),
+        false => {
+            scratch = env.mem.alloc();
+            scratch.realloc<u64>(null_ptr<u64>(), 7).match({
+                Err(_) => write_reply_body(fd, false, "Cannot allocate trace reply header."),
+                Ok(header) => {
+                    header.write(0, 72); // H followed by padding, on Apple targets.
+                    header.write(1, trace.request); header.write(2, trace.parent);
+                    header.write(3, trace.enqueued); header.write(4, trace.started);
+                    header.write(5, trace.ended); header.write(6, env.clock.since_start().ns);
+                    write_all(fd, str_at(header.to<u8>(), 56)).then(() { write_reply_body(fd, success, text); });
+                },
+            });
+        },
+    });
+}
+
 // Serialize actor results for the main-thread UI. Message text is copied by
 // the actor runtime, so the inference scratch arena can be released immediately.
 Results = { output: i32 }
 Results.impl(Actor, {
-    deliver = (self :: @Self, ctx: Context, success: bool, text: str) {
-        write_reply(self.output, success, text);
+    deliver = (self :: @Self, ctx: Context, trace: VoiceTrace, success: bool, text: str) {
+        write_reply(self.output, ctx.env, trace, success, text);
     }
 })
 
-reply = (results: Ref<Results>, fallback: i32, success: bool, text: str) () {
-    results.deliver(success, text).match({
+reply = (results: Ref<Results>, fallback: i32, env: Env, trace: VoiceTrace, success: bool, text: str) () {
+    timing ::= trace;
+    (trace.request > 0).then(() { timing = VoiceTrace(request: trace.request, parent: trace.parent, enqueued: trace.enqueued, started: trace.started, ended: env.clock.since_start().ns); });
+    results.deliver(timing, success, text).match({
         Ok(_)  => (),
         Err(_) => write_reply(
             fallback,
+            env,
+            timing,
             false,
             "Cannot enqueue transcription result."
         ),
@@ -84,7 +113,9 @@ Worker = {
 }
 
 Worker.impl(Actor, {
-    transcribe = (self :: @Self, ctx: Context, model: str, gpu: i32, pcm: str, rate: i32, preparation: bool) {
+    transcribe = (self :: @Self, ctx: Context, model: str, gpu: i32, pcm: str, rate: i32, preparation: bool, trace: VoiceTrace) {
+        timing ::= trace;
+        (trace.request > 0).then(() { timing = VoiceTrace(request: trace.request, parent: trace.parent, enqueued: trace.enqueued, started: ctx.env.clock.since_start().ns); });
         scratch ::= ctx.env.mem.alloc();
         self.recognizer.match({
             None  => {
@@ -93,13 +124,13 @@ Worker.impl(Actor, {
                     Err(error)     => error.match({
                         NativeError(detail) => reply(
                             self.results,
-                            self.fallback,
+                            self.fallback, ctx.env, timing,
                             false,
                             detail.message.view()
                         ),
                         _                   => reply(
                             self.results,
-                            self.fallback,
+                            self.fallback, ctx.env, timing,
                             false,
                             "Cannot load Parakeet model."
                         ),
@@ -117,7 +148,7 @@ Worker.impl(Actor, {
                 scratch.realloc<f32>(null_ptr<f32>(), count).match({
                     Err(_)      => reply(
                         self.results,
-                        self.fallback,
+                        self.fallback, ctx.env, timing,
                         false,
                         "Cannot allocate audio buffer."
                     ),
@@ -137,20 +168,20 @@ Worker.impl(Actor, {
                         ).match({
                             Ok(text)   => reply(
                                 self.results,
-                                self.fallback,
+                                self.fallback, ctx.env, timing,
                                 true,
                                 preparation.match({true => "", false => text.view()})
                             ),
                             Err(error) => error.match({
                                 NativeError(detail) => reply(
                                     self.results,
-                                    self.fallback,
+                                    self.fallback, ctx.env, timing,
                                     false,
                                     detail.message.view()
                                 ),
                                 _                   => reply(
                                     self.results,
-                                    self.fallback,
+                                    self.fallback, ctx.env, timing,
                                     false,
                                     "Parakeet transcription failed."
                                 ),
@@ -190,13 +221,15 @@ Transcriber* = {
     inflight_final :: bool,
     inflight_end :: bool,
     inflight_count :: usize,
+    trace_next :: VoiceTrace = VoiceTrace(),
+    inflight_trace :: VoiceTrace = VoiceTrace(),
 
     open* = (env: Env, a: Alloc) Res<Transcriber, MailboxError
         | ActorStartError
         | AllocError> {
         descriptors = a.realloc<i32>(null_ptr<i32>(), 2).try();
         @scope.defer(() { a.free(descriptors); });
-        buffer     = a.realloc<u8>(null_ptr<u8>(), 4096).try();
+        buffer     = a.realloc<u64>(null_ptr<u64>(), 512).try().to<u8>();
         descriptor = a.create<PollFd>().try();
         identity   = a.realloc<u8>(null_ptr<u8>(), 4096).try();
         (Posix.pipe(descriptors) == 0).ensure(MailboxError.OpenFailed).try();
@@ -239,6 +272,9 @@ Transcriber* = {
         })
     }
 
+    // Configure the next admission; in-flight context is carried in the message.
+    tracing* = (self :: @Self, trace: VoiceTrace) () { self.trace_next = trace; }
+
     compatible = (self: @Self, model: str, gpu: i32) bool {
         model.len > 0 && model.len <= 4096 && !model.contains(0) &&
             (self.identity_length == 0 || (self.identity_gpu == gpu && str_at(self.identity, self.identity_length).eq(model)))
@@ -258,7 +294,9 @@ Transcriber* = {
         (self.busy || self.input < 0 || !self.compatible(model, gpu)).match({
             true  => Ok(false),
             false => {
-                self.worker.transcribe(model, gpu, "", 16000, true).try();
+                self.worker.transcribe(model, gpu, "", 16000, true, self.trace_next).try();
+                self.inflight_trace = self.trace_next;
+                self.trace_next = VoiceTrace();
                 self.remember(model, gpu);
                 self.used                 = 0;
                 self.busy                 = true;
@@ -286,8 +324,11 @@ Transcriber* = {
                     gpu,
                     str_at(samples.to<u8>(), count * 4),
                     rate,
-                    false
+                    false,
+                    self.trace_next
                 ).try();
+                self.inflight_trace = self.trace_next;
+                self.trace_next = VoiceTrace();
                 self.remember(model, gpu);
                 self.inflight_preparation = false;
                 self.used                 = 0;
@@ -314,8 +355,11 @@ Transcriber* = {
                     gpu,
                     str_at(samples.to<u8>(), count * 4),
                     rate,
-                    false
+                    false,
+                    self.trace_next
                 ).try();
+                self.inflight_trace = self.trace_next;
+                self.trace_next = VoiceTrace();
                 self.remember(model, gpu);
                 self.inflight_preparation = false;
                 self.used                 = 0;
@@ -367,7 +411,9 @@ Transcriber* = {
                     MailboxError.ReadFailed
                 ).try();
                 self.used = self.used + count;
-                (self.buffer.read(self.used - 1) == 0).match({
+                traced = self.buffer.read(0) == 'H';
+                offset = traced.match({true => 57, false => 1});
+                (self.used >= offset + 1 && self.buffer.read(self.used - 1) == 0).match({
                     false => {
                         (self.used < 4096).ensure(
                             MailboxError.ReadFailed
@@ -376,10 +422,13 @@ Transcriber* = {
                     },
                     true  => {
                         self.busy = false;
+                        words = self.buffer.to<u64>();
+                        timing = traced.match({true => VoiceTrace(request: words.read(1), parent: words.read(2), enqueued: words.read(3), started: words.read(4), ended: words.read(5), replied: words.read(6)), false => self.inflight_trace});
                         Ok(Ok(Transcript(
+                            trace: timing,
                             preparation: self.inflight_preparation,
-                            success: self.buffer.read(0) != 'E',
-                            text: str_at(self.buffer.offset(1), self.used - 2),
+                            success: self.buffer.read(offset - 1) != 'E',
+                            text: str_at(self.buffer.offset(offset), self.used - offset - 1),
                             session: self.inflight,
                             final: self.inflight_final,
                             ends_capture: self.inflight_end,
