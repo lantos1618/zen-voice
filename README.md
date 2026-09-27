@@ -42,8 +42,20 @@ capture session and caps each request at 480,000 float32 samples. `segment`
 accepts separate `finalize` and `ends_capture` flags: a finalized phrase need
 not end the capture. All return `Ok(false)` when admission is refused, including
 when already busy. There is one outstanding request and no queued audio backlog.
-The first successfully loaded model/backend is cached until close; changing
-model arguments later does not replace it. CPU selection is `gpu = -1`.
+The model path and backend are pinned at the first accepted request. Later
+requests with a different path or backend return `Ok(false)`; close and reopen
+to change identity, including after a failed load. Paths are compared byte for
+byte, limited to 4,096 bytes, and must not contain NUL. CPU selection is `gpu = -1`.
+
+`prepare(model, gpu)` uses the same one-job admission slot and loads the model
+then decodes one second of silence on the worker. Call it before enabling
+capture to move model initialization and first inference away from first speech.
+The reply has `preparation = true`, session/count zero, and `final` and
+`ends_capture` false. On success its text is empty (discarded warm-up output),
+so it must never be committed to transcript history. On failure its text is the
+error. A successful preparation warms that duration only; longer audio shapes
+may still incur first-use work. Existing audio submits remain compatible and
+load lazily when preparation is omitted.
 
 The sample pointer must address `count` readable float32 values during the call.
 Actor message construction copies the PCM bytes before returning. The worker
@@ -52,7 +64,7 @@ native library. Caller buffers and native recognizer pointers are never sent
 across threads as borrowed actor-message payloads.
 
 `poll()` returns `Ok(None)` while pending or `Ok(Ok(Transcript))` when complete.
-It does not wait for inference. A reply contains `success`, `text`, `session`,
+It does not wait for inference. A reply contains `preparation`, `success`, `text`, `session`,
 `final`, `ends_capture`, and the exact submitted `count`. Text borrows the
 mailbox buffer until the next submit/poll; copy or consume it before then.
 Replies are UTF-8 truncated to 4,000 bytes. Capture audio is never implicitly
@@ -103,10 +115,10 @@ python3 tests/run.py
 python3 tests/run.py --model ../zen-parakeet/models/parakeet-tdt-0.6b-v3.q8_0.gguf --wav ../zen-parakeet/build/fixture.wav
 ```
 
-The mandatory native test checks model failure, one-in-flight admission,
+The mandatory native test checks preparation failure and reply tagging, model/backend identity refusal, one simulated hour of scheduler state, model failure, one-in-flight admission,
 nonblocking polling, repeated close, and live busy/final/stale scheduling.
 The optional WAV must be the known 16 kHz mono float32 quick-brown-fox fixture
-from zen-parakeet. It asserts recognized words in a live partial, the complete
+from zen-parakeet. It first prepares the real model, rejects changed model/backend requests, then asserts recognized words in a live partial, the complete
 final result, and a second finalized segment using the cached recognizer.
 Tests build temporary headless executables and never record a microphone or
 restart an app. ZenCode's `tests/transcription` separately checks 77.5 seconds

@@ -99,6 +99,69 @@ receive = (session :: Transcriber) Res<Transcript> {
     result
 }
 
+exercise_prepare = (env: Env, a: Alloc, model: str, expect_success: bool) bool {
+    Transcriber.open(env, a).match({
+        Err(_)     => false,
+        Ok(opened) => {
+            session ::= opened;
+            good    ::= session.prepare(
+                model,
+                -1
+            ).match({Ok(v) => v, Err(_) => false});
+            good = good && session.prepare(
+                model,
+                -1
+            ).match({Ok(v) => !v, Err(_) => false});
+            receive(session).match({
+                None       => { good = false; },
+                Ok(result) => {
+                    good = good && result.preparation && result.success == expect_success && result.session == 0 && result.count == 0 && !result.final && !result.ends_capture && !session.busy;
+                    expect_success.then(
+                        () { good = good && result.text.len == 0; }
+                    );
+                },
+            });
+            // A changed backend OR model must not silently use the cached model.
+            good = good && session.prepare(
+                model,
+                0
+            ).match({Ok(v) => !v, Err(_) => false});
+            good = good && session.prepare(
+                "/different-model.gguf",
+                -1
+            ).match({Ok(v) => !v, Err(_) => false});
+            good = good && !session.busy;
+            session.close();
+            good = good && session.prepare(
+                model,
+                -1
+            ).match({Ok(v) => !v, Err(_) => false});
+            good
+        },
+    })
+}
+
+// One simulated hour, including stopping with a busy final and stale replies.
+// This checks scheduler state, not recognition accuracy or real-time capture.
+long_schedule_checks = () bool {
+    live ::= Live();
+    live.observe(100);
+    good ::= true;
+    Range(0, 240).loop((i) {
+        good = good && live.due_segment(240000, true, false, false);
+        good = good && live.finalize(240000, true, false);
+        live.accepted_segment(240000, true);
+        good = good && !live.due_segment(256000, true, true, false);
+        good = good && live.committed(100, 16000, true);
+        good = good && live.due_segment(16000, true, false, false);
+    });
+    live.accepted_segment(16000, true);
+    good = good && live.due_segment(17000, false, false, false);
+    good = good && live.committed(100, 0, false) && live.finished;
+    live.observe(101);
+    good && !live.committed(100, 0, false) && !live.finished
+}
+
 exercise_live = (
     env   : Env,
     a     : Alloc,
@@ -109,7 +172,22 @@ exercise_live = (
         Err(_)     => 20,
         Ok(opened) => {
             session ::= opened;
-            live    ::= Live();
+            prepared     = session.prepare(
+                model,
+                -1
+            ).match({Ok(v) => v, Err(_) => false});
+            ready        = receive(
+                session
+            ).match({Ok(v) => v.preparation && v.success && v.text.len == 0, None => false});
+            pinned_model = session.prepare(
+                "/different-model.gguf",
+                -1
+            ).match({Ok(v) => !v, Err(_) => false});
+            pinned_gpu   = session.prepare(
+                model,
+                0
+            ).match({Ok(v) => !v, Err(_) => false});
+            live ::= Live();
             live.observe(11);
             prefix   = (audio.count > 64000).match({true => 64000, false => audio.count});
             accepted = session.snapshot(
@@ -122,12 +200,16 @@ exercise_live = (
                 false
             ).match({Ok(v) => v, Err(_) => false});
             live.accepted(prefix, true);
-            good ::= accepted && !live.due(audio.count, false, session.busy);
+            good ::= prepared && ready && pinned_model && pinned_gpu && accepted && !live.due(
+                audio.count,
+                false,
+                session.busy
+            );
             receive(session).match({
                 None        => { good = false; },
                 Ok(partial) => {
                     println("Partial before stop: {}", partial.text);
-                    good = good && partial.success && !partial.final && partial.session == 11 && partial.text.contains(
+                    good = good && !partial.preparation && partial.success && !partial.final && partial.session == 11 && partial.text.contains(
                         "quick"
                     );
                 },
@@ -150,7 +232,7 @@ exercise_live = (
                 Ok(final) => {
                     println("Final after busy: {}", final.text);
                     good = good && final.success && final.final && final.session == 11 && final.text.contains("quick brown fox") && final.text.contains("lazy dog");
-                    good         = good && !final.ends_capture && live.committed(
+                    good = good && !final.ends_capture && live.committed(
                         11,
                         0,
                         true
@@ -211,7 +293,7 @@ main = (env: Env) Res<i32, AllocError> {
         1
     ).match({Ok(path) => path, None => "/missing/zen-transcription-fixture.gguf"});
     wav   = env.argv.get(2).match({Ok(path) => path, None => ""});
-    (!schedule_checks()).match({
+    (!schedule_checks() || !long_schedule_checks()).match({
       true  => Ok(19),
       false => (wav.len > 0).match({
         true  => env.fs.read(a, wav).match({
@@ -240,7 +322,18 @@ main = (env: Env) Res<i32, AllocError> {
         false => {
             samples = a.realloc<f32>(null_ptr<f32>(), 16000).try();
             Range(0, 16000).loop((i) { samples.write(i, 0.0); });
-            Ok(exercise(env, a, model, samples, 16000, 16000, false))
+            exercise_prepare(env, a, model, false).match({
+                false => Ok(22),
+                true  => Ok(exercise(
+                    env,
+                    a,
+                    model,
+                    samples,
+                    16000,
+                    16000,
+                    false
+                )),
+            })
         },
     })
     })

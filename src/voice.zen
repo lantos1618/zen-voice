@@ -19,7 +19,7 @@ Polling = c.bind("poll.h", "poll", {
 })
 
 MailboxError* = OpenFailed | ReadFailed | Closed
-Transcript* = { success*: bool, text*: str, session*: usize, final*: bool, ends_capture*: bool, count*: usize }
+Transcript* = { preparation*: bool, success*: bool, text*: str, session*: usize, final*: bool, ends_capture*: bool, count*: usize }
 
 // The UI admits one job until its complete reply arrives. The result actor
 // writes that reply; rejected result admission uses the worker error fallback.
@@ -84,7 +84,7 @@ Worker = {
 }
 
 Worker.impl(Actor, {
-    transcribe = (self :: @Self, ctx: Context, model: str, gpu: i32, pcm: str, rate: i32) {
+    transcribe = (self :: @Self, ctx: Context, model: str, gpu: i32, pcm: str, rate: i32, preparation: bool) {
         scratch ::= ctx.env.mem.alloc();
         self.recognizer.match({
             None  => {
@@ -113,7 +113,7 @@ Worker.impl(Actor, {
             Ok(recognizer) => {
                 // Actor message bytes are copied; copy again into f32-aligned
                 // storage instead of assuming the packed str payload alignment.
-                count = pcm.len / 4;
+                count = preparation.match({true => 16000, false => pcm.len / 4});
                 scratch.realloc<f32>(null_ptr<f32>(), count).match({
                     Err(_)      => reply(
                         self.results,
@@ -122,7 +122,13 @@ Worker.impl(Actor, {
                         "Cannot allocate audio buffer."
                     ),
                     Ok(samples) => {
-                        samples.to<u8>().copy_from(pcm.ptr(), count * 4);
+                        preparation.match({
+                            true  => Range(0, count).loop((i) { samples.write(i, 0.0); }),
+                            false => samples.to<u8>().copy_from(
+                                pcm.ptr(),
+                                count * 4
+                            ),
+                        });
                         recognizer.transcribe(
                             scratch,
                             samples,
@@ -133,7 +139,7 @@ Worker.impl(Actor, {
                                 self.results,
                                 self.fallback,
                                 true,
-                                text.view()
+                                preparation.match({true => "", false => text.view()})
                             ),
                             Err(error) => error.match({
                                 NativeError(detail) => reply(
@@ -174,6 +180,10 @@ Transcriber* = {
     output :: i32,
     descriptor: Ptr<PollFd>,
     buffer: Ptr<u8>,
+    identity: Ptr<u8>,
+    identity_length :: usize,
+    identity_gpu :: i32,
+    inflight_preparation :: bool,
     used :: usize,
     busy* :: bool,
     inflight :: usize,
@@ -188,6 +198,7 @@ Transcriber* = {
         @scope.defer(() { a.free(descriptors); });
         buffer     = a.realloc<u8>(null_ptr<u8>(), 4096).try();
         descriptor = a.create<PollFd>().try();
+        identity   = a.realloc<u8>(null_ptr<u8>(), 4096).try();
         (Posix.pipe(descriptors) == 0).ensure(MailboxError.OpenFailed).try();
         input  = descriptors.read(0);
         output = descriptors.read(1);
@@ -213,6 +224,10 @@ Transcriber* = {
                     output: output,
                     descriptor: descriptor,
                     buffer: buffer,
+                    identity: identity,
+                    identity_length: 0,
+                    identity_gpu: 0,
+                    inflight_preparation: false,
                     used: 0,
                     busy: false,
                     inflight: 0,
@@ -224,24 +239,63 @@ Transcriber* = {
         })
     }
 
-    // The first successful model/gpu configuration stays cached until close.
+    compatible = (self: @Self, model: str, gpu: i32) bool {
+        model.len > 0 && model.len <= 4096 && !model.contains(0) &&
+            (self.identity_length == 0 || (self.identity_gpu == gpu && str_at(self.identity, self.identity_length).eq(model)))
+    }
+
+    remember = (self :: @Self, model: str, gpu: i32) () {
+        (self.identity_length == 0).then(() {
+            self.identity.copy_from(model.ptr(), model.len);
+            self.identity_length = model.len;
+            self.identity_gpu    = gpu;
+        });
+    }
+
+    // Model load and a one-second silence decode run on the inference actor.
+    // The reply is explicitly preparation, never user-visible transcription.
+    prepare* = (self :: @Self, model: str, gpu: i32) Res<bool, ActorError> {
+        (self.busy || self.input < 0 || !self.compatible(model, gpu)).match({
+            true  => Ok(false),
+            false => {
+                self.worker.transcribe(model, gpu, "", 16000, true).try();
+                self.remember(model, gpu);
+                self.used                 = 0;
+                self.busy                 = true;
+                self.inflight_preparation = true;
+                self.inflight             = 0;
+                self.inflight_final       = false;
+                self.inflight_end         = false;
+                self.inflight_count       = 0;
+                Ok(true)
+            },
+        })
+    }
+
+    // The first admitted model/gpu identity stays pinned until close.
     submit* = (self :: @Self, model: str, gpu: i32, samples: Ptr<f32>, count: usize, rate: i32)
               Res<bool, ActorError> {
-        (self.busy || self.input < 0 || model.len == 0 || samples.is_null() || count == 0 || count > 5760000).match({
+        (self.busy || self.input < 0 || !self.compatible(
+            model,
+            gpu
+        ) || samples.is_null() || count == 0 || count > 5760000).match({
             true  => Ok(false),
             false => {
                 self.worker.transcribe(
                     model,
                     gpu,
                     str_at(samples.to<u8>(), count * 4),
-                    rate
+                    rate,
+                    false
                 ).try();
-                self.used           = 0;
-                self.busy           = true;
-                self.inflight       = 0;
-                self.inflight_final = true;
-                self.inflight_end   = true;
-                self.inflight_count = count;
+                self.remember(model, gpu);
+                self.inflight_preparation = false;
+                self.used                 = 0;
+                self.busy                 = true;
+                self.inflight             = 0;
+                self.inflight_final       = true;
+                self.inflight_end         = true;
+                self.inflight_count       = count;
                 Ok(true)
             },
         })
@@ -249,21 +303,27 @@ Transcriber* = {
 
     snapshot* = (self :: @Self, model: str, gpu: i32, session: usize, samples: Ptr<f32>, count: usize, rate: i32, finish: bool)
             Res<bool, ActorError> {
-        (self.busy || self.input < 0 || model.len == 0 || session == 0 || samples.is_null() || count == 0 || count > 480000).match({
+        (self.busy || self.input < 0 || !self.compatible(
+            model,
+            gpu
+        ) || session == 0 || samples.is_null() || count == 0 || count > 480000).match({
             true  => Ok(false),
             false => {
                 self.worker.transcribe(
                     model,
                     gpu,
                     str_at(samples.to<u8>(), count * 4),
-                    rate
+                    rate,
+                    false
                 ).try();
-                self.used           = 0;
-                self.busy           = true;
-                self.inflight       = session;
-                self.inflight_final = finish;
-                self.inflight_end   = finish;
-                self.inflight_count = count;
+                self.remember(model, gpu);
+                self.inflight_preparation = false;
+                self.used                 = 0;
+                self.busy                 = true;
+                self.inflight             = session;
+                self.inflight_final       = finish;
+                self.inflight_end         = finish;
+                self.inflight_count       = count;
                 Ok(true)
             },
         })
@@ -317,6 +377,7 @@ Transcriber* = {
                     true  => {
                         self.busy = false;
                         Ok(Ok(Transcript(
+                            preparation: self.inflight_preparation,
                             success: self.buffer.read(0) != 'E',
                             text: str_at(self.buffer.offset(1), self.used - 2),
                             session: self.inflight,

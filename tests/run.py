@@ -42,13 +42,13 @@ build = (b :: Builder) Res<(), BuildError> {
     subprocess.run([str(args.zen.resolve()), 'build', '.'], cwd=target, env=env,
                    check=True, timeout=120)
     subprocess.run([str(target / 'check')], check=True, timeout=150)
-    print('PASS: live scheduling, busy/final/stale handling, model error, admission, polling, repeated close')
+    print('PASS: one-hour scheduling, preparation errors/tagging, pinned identity, busy/final/stale handling, model error, admission, polling, repeated close')
     if args.model:
         subprocess.run([str(target / 'check'), str(args.model.resolve()), str(args.wav.resolve())],
                        check=True, timeout=150)
         print('PASS: real-model background transcription')
         subprocess.run([str(target / 'check'), str(args.model.resolve()), str(args.wav.resolve()), '--live'],
                        check=True, timeout=240)
-        print('PASS: live partial contains quick; final contains quick brown fox and lazy dog')
+        print('PASS: real-model preparation, pinned identity, live partial contains quick; final contains quick brown fox and lazy dog')
     else:
         print('SKIP: real-model inference; supply --model MODEL.gguf --wav mono-float32.wav')
