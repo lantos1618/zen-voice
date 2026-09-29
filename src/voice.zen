@@ -45,7 +45,7 @@ write_all = (fd: i32, text: str) bool {
     good
 }
 
-write_reply_body = (fd: i32, success: bool, text: str) () {
+write_reply_body = (fd: i32, success: bool, text: str) {
     length ::= text.len;
     (length > 4000).then(() {
         length = 4000;
@@ -62,7 +62,7 @@ write_reply_body = (fd: i32, success: bool, text: str) () {
 // Optional 56-byte native-process header. The existing single-writer framing
 // stays bounded at 4058 bytes, below the caller's 4096-byte buffer. Disabled
 // tracing uses exactly the legacy status/text/NUL framing and no trace scratch.
-write_reply = (fd: i32, env: Env, trace: VoiceTrace, success: bool, text: str) () {
+write_reply = (fd: i32, env: Env, trace: VoiceTrace, success: bool, text: str) {
     (trace.request == 0).match({
         true => write_reply_body(fd, success, text),
         false => {
@@ -90,7 +90,7 @@ Results.impl(Actor, {
     }
 })
 
-reply = (results: Ref<Results>, fallback: i32, env: Env, trace: VoiceTrace, success: bool, text: str) () {
+reply = (results: Ref<Results>, fallback: i32, env: Env, trace: VoiceTrace, success: bool, text: str) {
     timing ::= trace;
     (trace.request > 0).then(() { timing = VoiceTrace(request: trace.request, parent: trace.parent, enqueued: trace.enqueued, started: trace.started, ended: env.clock.since_start().ns); });
     results.deliver(timing, success, text).match({
@@ -273,14 +273,14 @@ Transcriber* = {
     }
 
     // Configure the next admission; in-flight context is carried in the message.
-    tracing* = (self :: @Self, trace: VoiceTrace) () { self.trace_next = trace; }
+    tracing* = (self :: @Self, trace: VoiceTrace) { self.trace_next = trace; }
 
     compatible = (self: @Self, model: str, gpu: i32) bool {
         model.len > 0 && model.len <= 4096 && !model.contains(0) &&
             (self.identity_length == 0 || (self.identity_gpu == gpu && str_at(self.identity, self.identity_length).eq(model)))
     }
 
-    remember = (self :: @Self, model: str, gpu: i32) () {
+    remember = (self :: @Self, model: str, gpu: i32) {
         (self.identity_length == 0).then(() {
             self.identity.copy_from(model.ptr(), model.len);
             self.identity_length = model.len;
@@ -440,7 +440,7 @@ Transcriber* = {
         })
     }
 
-    close* = (self :: @Self) () {
+    close* = (self :: @Self) {
         (self.input >= 0).then(() {
             self.worker.stop();
             self.worker.join();
@@ -463,7 +463,7 @@ Live* = {
     finished* :: bool = false,
     failed* :: bool = false,
 
-    observe* = (self :: @Self, session: usize) () {
+    observe* = (self :: @Self, session: usize) {
         (self.session != session).then(() {
             self.session  = session;
             self.sent     = 0;
@@ -477,7 +477,7 @@ Live* = {
             active.match({true => count - self.sent >= 16000, false => !self.finished})
     }
 
-    accepted* = (self :: @Self, count: usize, active: bool) () {
+    accepted* = (self :: @Self, count: usize, active: bool) {
         self.sent     = count;
         self.finished = !active;
     }
@@ -496,7 +496,7 @@ Live* = {
         self.due(count, active, busy) || (self.session > 0 && !busy && !self.failed && !self.finished && count > 0 && self.finalize(count, active, quiet))
     }
 
-    accepted_segment* = (self :: @Self, count: usize, active: bool) () {
+    accepted_segment* = (self :: @Self, count: usize, active: bool) {
         self.accepted(count, active);
     }
 
@@ -511,7 +511,7 @@ Live* = {
 
     current* = (self: @Self, session: usize) bool { self.session == session }
 
-    fail* = (self :: @Self) () { self.failed = true; }
+    fail* = (self :: @Self) { self.failed = true; }
 }
 
 quiet_tail* = (samples: Ptr<f32>, count: usize) bool {
